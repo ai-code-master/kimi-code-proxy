@@ -1,0 +1,3 @@
+# Kimi Code OAuth Proxy
+# Pure Python standard library — no external packages required.
+# Python >= 3.9 recommended.

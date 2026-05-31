@@ -1,0 +1,27 @@
+# Environment files
+.env
+.venv
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs
+logs/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Credentials (never commit!)
+*.json
+!example-credentials.json
