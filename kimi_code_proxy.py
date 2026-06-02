@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Kimi Code OAuth Proxy v2.7
+Kimi Code OAuth Proxy v2.8
 
 A local HTTP proxy that bridges OpenAI-compatible clients (like Hermes)
 to the Kimi Code API with automatic OAuth token refresh.
 
-Changelog v2.7:
-- Graceful shutdown on SIGTERM/SIGINT (waits for active requests)
-- Upstream health probe in /healthz (cached, background-checked every 30s)
-- KCP_DEBUG_BODY switch for request/response body logging
-- Body parse errors logged at debug level instead of silently swallowed
+Changelog v2.8:
+- Dynamic max_tokens: smaller requests get smaller max_tokens
+- Model list cache: avoids repeated upstream /v1/models queries
+- Hot-reload .env via SIGHUP or /admin/reload endpoint
+- Admin API for runtime config inspection
 """
 
 import http.client
@@ -42,6 +42,33 @@ def _load_dotenv(path=".env"):
                         os.environ[k] = v.strip()
     except Exception:
         pass
+
+
+def _reload_config():
+    """Re-read .env and update runtime globals."""
+    global MAX_CONCURRENT, RPM_LIMIT, MAX_RETRIES, BACKOFF_BASE
+    global REFRESH_INTERVAL, REFRESH_THRESHOLD, UPSTREAM_TIMEOUT
+    global QUEUE_TIMEOUT, MAX_BODY_SIZE, SLOW_REQUEST_THRESHOLD
+    global GRACEFUL_SHUTDOWN_WAIT, DEBUG_BODY, LOG_DIR_MAX_BYTES
+
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _load_dotenv(os.path.join(_script_dir, ".env"))
+
+    MAX_CONCURRENT   = int(_env("KCP_MAX_CONCURRENT", "30"))
+    RPM_LIMIT        = int(_env("KCP_RPM_LIMIT", "0"))
+    MAX_RETRIES      = int(_env("KCP_MAX_RETRIES", "2"))
+    BACKOFF_BASE     = float(_env("KCP_BACKOFF_BASE", "1.0"))
+    REFRESH_INTERVAL = int(_env("KCP_REFRESH_INTERVAL", "300"))
+    REFRESH_THRESHOLD = int(_env("KCP_REFRESH_THRESHOLD", "300"))
+    UPSTREAM_TIMEOUT = int(_env("KCP_UPSTREAM_TIMEOUT", "600"))
+    QUEUE_TIMEOUT    = int(_env("KCP_QUEUE_TIMEOUT", "300"))
+    MAX_BODY_SIZE    = int(_env("KCP_MAX_BODY_SIZE", str(50 * 1024 * 1024)))
+    SLOW_REQUEST_THRESHOLD = float(_env("KCP_SLOW_REQUEST_THRESHOLD", "30.0"))
+    GRACEFUL_SHUTDOWN_WAIT = int(_env("KCP_GRACEFUL_SHUTDOWN_WAIT", "30"))
+    DEBUG_BODY       = _env("KCP_DEBUG_BODY", "").lower() in ("1", "true", "yes")
+    LOG_DIR_MAX_BYTES = int(_env("KCP_LOG_DIR_MAX_BYTES", str(500 * 1024 * 1024)))
+
+    logger.info("Config reloaded")
 
 
 # Auto-load .env from the same directory as this script
@@ -257,7 +284,6 @@ class RPMLimiter:
         now = time.time()
         window_start = now - 60
         with self._lock:
-            # Drop old timestamps
             self._timestamps = [t for t in self._timestamps if t > window_start]
             if len(self._timestamps) >= self._max_rpm:
                 return False
@@ -279,6 +305,49 @@ kimi_semaphore = threading.Semaphore(MAX_CONCURRENT)
 _active_requests_lock = threading.Lock()
 _active_requests = 0
 _shutdown_event = threading.Event()
+
+# ==================== Model List Cache ====================
+class ModelListCache:
+    """Cache upstream /v1/models to avoid repeated queries."""
+
+    def __init__(self, ttl: int = 300):
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self._data = None
+        self._expires_at = 0
+
+    def get(self, token: str) -> bytes | None:
+        with self._lock:
+            if self._data and time.time() < self._expires_at:
+                return self._data
+        # Cache miss or expired — fetch from upstream
+        try:
+            parsed = urllib.parse.urlparse(UPSTREAM_BASE)
+            conn = http.client.HTTPSConnection(parsed.netloc, timeout=10)
+            try:
+                conn.request(
+                    "GET",
+                    f"{parsed.path}/v1/models",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "User-Agent": "KimiCLI/1.5",
+                    },
+                )
+                resp = conn.getresponse()
+                data = resp.read()
+                if resp.status == 200:
+                    with self._lock:
+                        self._data = data
+                        self._expires_at = time.time() + self._ttl
+                    return data
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug(f"Model list fetch failed: {e}")
+        return None
+
+
+model_cache = ModelListCache(ttl=300)
 
 # ==================== Upstream Health Probe ====================
 class UpstreamHealth:
@@ -305,7 +374,6 @@ class UpstreamHealth:
                     },
                 )
                 resp = conn.getresponse()
-                # 200 or 401 with valid auth means upstream is reachable
                 healthy = resp.status in (200, 401)
             finally:
                 conn.close()
@@ -331,7 +399,6 @@ class UpstreamHealth:
 
     def is_healthy(self):
         with self._lock:
-            # Stale check if too old (e.g. probe thread died)
             if time.time() - self._last_check > self._check_interval * 3:
                 return False
             return self._healthy
@@ -344,7 +411,6 @@ def _upstream_probe_worker():
     check_interval = upstream_health._check_interval
     while not _shutdown_event.is_set():
         upstream_health.check()
-        # Sleep in small chunks so we can exit quickly on shutdown
         for _ in range(check_interval):
             if _shutdown_event.is_set():
                 break
@@ -505,6 +571,39 @@ def classify_error(e):
     return err_name.lower(), str(e)
 
 
+# ==================== Dynamic max_tokens ====================
+def _estimate_tokens(body_dict: dict) -> int:
+    """Roughly estimate input token count from messages."""
+    messages = body_dict.get("messages", [])
+    if not isinstance(messages, list):
+        return 0
+    total_chars = 0
+    for msg in messages:
+        if isinstance(msg, dict):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and "text" in part:
+                        total_chars += len(part["text"])
+    # Rough heuristic: 1 token ≈ 1.5 Chinese chars or 4 English chars
+    # Use a blended estimate
+    return total_chars // 2
+
+
+def _dynamic_max_tokens(body_dict: dict) -> int:
+    """Return a max_tokens value based on estimated input size."""
+    est = _estimate_tokens(body_dict)
+    if est < 2000:
+        return 4096
+    if est < 8000:
+        return 8192
+    if est < 16000:
+        return 16384
+    return 32768
+
+
 # ==================== Request Body Helpers ====================
 _THINKING_BUDGET_MAP = {
     "low": 4000,
@@ -558,13 +657,26 @@ def _do_kimi_request(method, target_url, body, headers, retries=0):
         return None, e
 
 
+# ==================== Admin Config ====================
+def _current_config():
+    return {
+        "max_concurrent": MAX_CONCURRENT,
+        "rpm_limit": RPM_LIMIT,
+        "upstream_timeout": UPSTREAM_TIMEOUT,
+        "queue_timeout": QUEUE_TIMEOUT,
+        "max_body_size": MAX_BODY_SIZE,
+        "slow_request_threshold": SLOW_REQUEST_THRESHOLD,
+        "debug_body": DEBUG_BODY,
+    }
+
+
 # ==================== HTTP Proxy ====================
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # Override to suppress default stderr logging
     def log_message(self, format, *args):
-        if self.path not in ("/healthz", "/metrics"):
+        if self.path not in ("/healthz", "/metrics", "/admin/config", "/admin/reload"):
             logger.info(f"{self.command} {self.path} -> {args[1]}")
 
     # Catch client disconnects early to avoid stderr spam
@@ -599,6 +711,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         request_id = self.headers.get("x-request-id", "")
         if not request_id:
             request_id = f"kp-{uuid.uuid4().hex[:12]}"
+
+        # --- Admin endpoints ---
+        if self.path == "/admin/config":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(json.dumps(_current_config()).encode())
+            return
+
+        if self.path == "/admin/reload":
+            _reload_config()
+            global rpm_limiter
+            rpm_limiter = RPMLimiter(RPM_LIMIT)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "reloaded", "config": _current_config()}).encode())
+            return
 
         token = token_mgr.get_token()
         if not token:
@@ -638,6 +770,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if path.startswith("/v1/models/"):
             path = "/v1/models"
 
+        # --- Model list cache for GET /v1/models ---
+        if method == "GET" and path == "/v1/models":
+            cached = model_cache.get(token)
+            if cached:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(cached)
+                self.wfile.flush()
+                logger.info(f"[{request_id}] {client_ip} -> 200 (model_cache_hit)")
+                return
+
         if path.startswith("/v1/"):
             target_url = f"{UPSTREAM_BASE}{path}"
         elif path == "/chat/completions":
@@ -648,15 +793,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             target_url = f"{UPSTREAM_BASE}/v1{path}"
 
         # --- Body enrichment ---
-        DEFAULT_MAX_TOKENS = 32768
         model_name = ""
         try:
             req_json = json.loads(body) if body else {}
             if isinstance(req_json, dict):
                 model_name = req_json.get("model", "")
+                # Dynamic max_tokens based on estimated input size
                 if "max_tokens" not in req_json:
-                    req_json["max_tokens"] = DEFAULT_MAX_TOKENS
-                    logger.info(f"[{request_id}] Injected max_tokens={DEFAULT_MAX_TOKENS}")
+                    suggested = _dynamic_max_tokens(req_json)
+                    req_json["max_tokens"] = suggested
+                    logger.info(f"[{request_id}] Dynamic max_tokens={suggested} (est_input ~{_estimate_tokens(req_json)} tokens)")
                 else:
                     logger.debug(f"[{request_id}] Preserving max_tokens={req_json['max_tokens']}")
                 req_json = _maybe_inject_thinking(req_json)
@@ -789,7 +935,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             health = {
                 "status": "ok" if upstream_ok else "degraded",
                 "upstream_healthy": upstream_ok,
-                "version": "2.7",
+                "version": "2.8",
                 "token_expires_at": token_mgr._data.get("expires_at", 0),
                 "token_remaining": max(0, token_mgr._data.get("expires_at", 0) - time.time()),
                 "concurrent_limit": MAX_CONCURRENT,
@@ -812,6 +958,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "graceful_shutdown",
                     "upstream_health_probe",
                     "debug_body",
+                    "model_list_cache",
+                    "dynamic_max_tokens",
+                    "hot_reload",
                 ],
             }
             self.wfile.write(json.dumps(health).encode())
@@ -835,6 +984,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def _signal_handler(signum, frame):
     sig_name = signal.Signals(signum).name
+    if sig_name == "SIGHUP":
+        logger.info("Received SIGHUP, reloading config...")
+        _reload_config()
+        global rpm_limiter
+        rpm_limiter = RPMLimiter(RPM_LIMIT)
+        return
     logger.info(f"Received {sig_name}, starting graceful shutdown...")
     _shutdown_event.set()
 
@@ -842,9 +997,10 @@ def _signal_handler(signum, frame):
 def main():
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGHUP, _signal_handler)
 
     server = ThreadingHTTPServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
-    logger.info("Kimi Code Proxy v2.7 started")
+    logger.info("Kimi Code Proxy v2.8 started")
     logger.info(f"  Listen: http://{PROXY_HOST}:{PROXY_PORT}")
     logger.info(f"  Upstream: {UPSTREAM_BASE}")
     logger.info(f"  Concurrent: {MAX_CONCURRENT}, RPM limit: {RPM_LIMIT}, Upstream timeout: {UPSTREAM_TIMEOUT}s, Queue timeout: {QUEUE_TIMEOUT}s")
