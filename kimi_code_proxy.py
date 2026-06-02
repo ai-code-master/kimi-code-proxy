@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Kimi Code OAuth Proxy v2.8
+Kimi Code OAuth Proxy v2.9
 
 A local HTTP proxy that bridges OpenAI-compatible clients (like Hermes)
 to the Kimi Code API with automatic OAuth token refresh.
+
+Changelog v2.9:
+- Response cache: identical non-streaming requests return cached result (saves 100% token)
+- Message truncation: auto-truncate long conversation history to reduce input tokens
 
 Changelog v2.8:
 - Dynamic max_tokens: smaller requests get smaller max_tokens
@@ -12,6 +16,7 @@ Changelog v2.8:
 - Admin API for runtime config inspection
 """
 
+import hashlib
 import http.client
 import json
 import logging
@@ -68,6 +73,14 @@ def _reload_config():
     DEBUG_BODY       = _env("KCP_DEBUG_BODY", "").lower() in ("1", "true", "yes")
     LOG_DIR_MAX_BYTES = int(_env("KCP_LOG_DIR_MAX_BYTES", str(500 * 1024 * 1024)))
 
+    global ENABLE_CACHE, CACHE_TTL, CACHE_MAX_ENTRIES
+    global ENABLE_TRUNCATE, MAX_HISTORY_PAIRS, MAX_ASSISTANT_CHARS
+    ENABLE_CACHE     = _env("KCP_ENABLE_CACHE", "1").lower() in ("1", "true", "yes")
+    CACHE_TTL        = int(_env("KCP_CACHE_TTL", "300"))
+    CACHE_MAX_ENTRIES = int(_env("KCP_CACHE_MAX_ENTRIES", "100"))
+    ENABLE_TRUNCATE  = _env("KCP_ENABLE_TRUNCATE", "1").lower() in ("1", "true", "yes")
+    MAX_HISTORY_PAIRS = int(_env("KCP_MAX_HISTORY_PAIRS", "10"))
+    MAX_ASSISTANT_CHARS = int(_env("KCP_MAX_ASSISTANT_CHARS", "2000"))
     logger.info("Config reloaded")
 
 
@@ -99,6 +112,14 @@ MAX_BODY_SIZE    = int(_env("KCP_MAX_BODY_SIZE", str(50 * 1024 * 1024)))  # 50MB
 SLOW_REQUEST_THRESHOLD = float(_env("KCP_SLOW_REQUEST_THRESHOLD", "30.0"))
 GRACEFUL_SHUTDOWN_WAIT = int(_env("KCP_GRACEFUL_SHUTDOWN_WAIT", "30"))
 DEBUG_BODY       = _env("KCP_DEBUG_BODY", "").lower() in ("1", "true", "yes")
+
+# Cache & Truncation
+ENABLE_CACHE     = _env("KCP_ENABLE_CACHE", "1").lower() in ("1", "true", "yes")
+CACHE_TTL        = int(_env("KCP_CACHE_TTL", "300"))
+CACHE_MAX_ENTRIES = int(_env("KCP_CACHE_MAX_ENTRIES", "100"))
+ENABLE_TRUNCATE  = _env("KCP_ENABLE_TRUNCATE", "1").lower() in ("1", "true", "yes")
+MAX_HISTORY_PAIRS = int(_env("KCP_MAX_HISTORY_PAIRS", "10"))
+MAX_ASSISTANT_CHARS = int(_env("KCP_MAX_ASSISTANT_CHARS", "2000"))
 
 # Logging
 LOG_DIR          = _env("KCP_LOG_DIR", os.path.expanduser("~/.hermes/logs"))
@@ -348,6 +369,99 @@ class ModelListCache:
 
 
 model_cache = ModelListCache(ttl=300)
+
+# ==================== Response Cache (chat completions) ====================
+class ResponseCache:
+    """In-memory cache for LLM non-streaming responses.
+    
+    Keyed by deterministic hash of cacheable request fields.
+    Only caches /v1/chat/completions with stream=false and no tools.
+    """
+
+    def __init__(self, ttl: int = 300, max_entries: int = 100):
+        self._ttl = ttl
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+        self._cache = {}  # key -> (expires_at, data_bytes, headers_list)
+        self._hit_count = 0
+        self._miss_count = 0
+
+    def _make_key(self, path: str, body_dict: dict) -> str:
+        """Create cache key; return '' if request should not be cached."""
+        if not ENABLE_CACHE:
+            return ""
+        # Only cache chat completions
+        if path not in ("/v1/chat/completions", "/chat/completions"):
+            return ""
+        # Don't cache streaming
+        if body_dict.get("stream"):
+            return ""
+        # Don't cache tool-related requests (results vary)
+        if body_dict.get("tools") or body_dict.get("tool_choice"):
+            return ""
+        # Fields that affect output
+        cacheable = {"model", "messages", "temperature", "top_p",
+                     "max_tokens", "presence_penalty", "frequency_penalty",
+                     "response_format", "thinking", "reasoning_effort"}
+        payload = {k: body_dict.get(k) for k in cacheable if k in body_dict}
+        # Omit default temperature to increase hit rate
+        if payload.get("temperature") == 1.0:
+            del payload["temperature"]
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def get(self, path: str, body_dict: dict) -> tuple[bytes, list] | None:
+        key = self._make_key(path, body_dict)
+        if not key:
+            return None
+        with self._lock:
+            entry = self._cache.get(key)
+            if not entry:
+                self._miss_count += 1
+                return None
+            expires_at, data, headers = entry
+            if time.time() > expires_at:
+                del self._cache[key]
+                self._miss_count += 1
+                return None
+            self._hit_count += 1
+            return data, headers
+
+    def put(self, path: str, body_dict: dict, data: bytes, headers: list, status: int):
+        if status != 200:
+            return
+        key = self._make_key(path, body_dict)
+        if not key:
+            return
+        with self._lock:
+            if len(self._cache) >= self._max_entries:
+                # Evict oldest by expiration time
+                oldest = min(self._cache.keys(), key=lambda k: self._cache[k][0])
+                del self._cache[oldest]
+            filtered = [(h, v) for h, v in headers if h.lower() == "content-type"]
+            self._cache[key] = (time.time() + self._ttl, data, filtered)
+
+    def stats(self):
+        with self._lock:
+            total = self._hit_count + self._miss_count
+            return {
+                "enabled": ENABLE_CACHE,
+                "entries": len(self._cache),
+                "ttl": self._ttl,
+                "max_entries": self._max_entries,
+                "hit_count": self._hit_count,
+                "miss_count": self._miss_count,
+                "hit_rate": round(self._hit_count / total, 4) if total else 0.0,
+            }
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+            self._hit_count = 0
+            self._miss_count = 0
+
+
+response_cache = ResponseCache(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
 
 # ==================== Upstream Health Probe ====================
 class UpstreamHealth:
@@ -632,6 +746,54 @@ def _safe_body_preview(body: bytes, max_len: int = 500) -> str:
     return body[:max_len].decode("utf-8", errors="replace")
 
 
+def _truncate_messages(body_dict: dict) -> dict:
+    """Truncate conversation history to reduce input tokens.
+
+    Strategy:
+    1. Keep system messages intact.
+    2. Keep last N user-assistant pairs (configurable via KCP_MAX_HISTORY_PAIRS).
+    3. Truncate very long individual assistant messages.
+    """
+    if not ENABLE_TRUNCATE:
+        return body_dict
+    messages = body_dict.get("messages", [])
+    if not isinstance(messages, list) or len(messages) <= 2:
+        return body_dict
+
+    system_msgs = []
+    conv_msgs = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            system_msgs.append(msg)
+        else:
+            conv_msgs.append(msg)
+
+    # Keep last N pairs (2 messages per pair)
+    keep_count = max(MAX_HISTORY_PAIRS * 2, 4)  # at least 4 messages
+    truncated_info = ""
+    if len(conv_msgs) > keep_count:
+        drop_count = len(conv_msgs) - keep_count
+        conv_msgs = conv_msgs[-keep_count:]
+        truncated_info = f" (dropped {drop_count} older messages)"
+
+    # Truncate long assistant messages
+    trunc_count = 0
+    for msg in conv_msgs:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, str) and len(content) > MAX_ASSISTANT_CHARS:
+                msg["content"] = content[:MAX_ASSISTANT_CHARS] + "\n\n[...truncated by proxy]"
+                trunc_count += 1
+
+    if truncated_info or trunc_count:
+        logger.info(
+            f"Message truncation:{truncated_info} assistant_msgs_truncated={trunc_count} "
+            f"final_count={len(system_msgs) + len(conv_msgs)}"
+        )
+    body_dict["messages"] = system_msgs + conv_msgs
+    return body_dict
+
+
 # ==================== Core Request Function ====================
 def _do_kimi_request(method, target_url, body, headers, retries=0):
     parsed = urllib.parse.urlparse(target_url)
@@ -667,6 +829,16 @@ def _current_config():
         "max_body_size": MAX_BODY_SIZE,
         "slow_request_threshold": SLOW_REQUEST_THRESHOLD,
         "debug_body": DEBUG_BODY,
+        "cache": {
+            "enabled": ENABLE_CACHE,
+            "ttl": CACHE_TTL,
+            "max_entries": CACHE_MAX_ENTRIES,
+        },
+        "truncation": {
+            "enabled": ENABLE_TRUNCATE,
+            "max_history_pairs": MAX_HISTORY_PAIRS,
+            "max_assistant_chars": MAX_ASSISTANT_CHARS,
+        },
     }
 
 
@@ -794,10 +966,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # --- Body enrichment ---
         model_name = ""
+        req_json = {}
         try:
             req_json = json.loads(body) if body else {}
             if isinstance(req_json, dict):
                 model_name = req_json.get("model", "")
+                # Truncate long conversation history
+                req_json = _truncate_messages(req_json)
                 # Dynamic max_tokens based on estimated input size
                 if "max_tokens" not in req_json:
                     suggested = _dynamic_max_tokens(req_json)
@@ -807,10 +982,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     logger.debug(f"[{request_id}] Preserving max_tokens={req_json['max_tokens']}")
                 req_json = _maybe_inject_thinking(req_json)
                 body = json.dumps(req_json).encode("utf-8")
+                body_len = len(body)
         except Exception as e:
             logger.debug(f"[{request_id}] Body enrichment skipped: {e}")
             if DEBUG_BODY and body:
                 logger.debug(f"[{request_id}] Raw body preview: {_safe_body_preview(body)}")
+
+        # --- Response cache check ---
+        if method == "POST" and req_json:
+            cached = response_cache.get(path, req_json)
+            if cached:
+                data, resp_headers = cached
+                self.send_response(200)
+                for h, v in resp_headers:
+                    self.send_header(h, v)
+                self.send_header("X-Cache", "HIT")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    logger.debug("Client disconnected during cached response write")
+                latency = time.time() - start_time
+                metrics.record_request(latency, 200, model=model_name)
+                logger.info(f"[{request_id}] {client_ip} -> 200 (cache_hit) latency={latency:.2f}s model={model_name or '-'}")
+                return
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -882,6 +1080,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         resp._conn.close()
                 if DEBUG_BODY and resp_body:
                     logger.debug(f"[{request_id}] Response body preview: {_safe_body_preview(resp_body)}")
+                # Store successful response in cache
+                if req_json and status == 200:
+                    response_cache.put(path, req_json, resp_body, resp.getheaders(), status)
                 log_level = logger.warning if latency > SLOW_REQUEST_THRESHOLD else logger.info
                 log_level(
                     f"[{request_id}] {client_ip} -> {status} "
@@ -935,11 +1136,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             health = {
                 "status": "ok" if upstream_ok else "degraded",
                 "upstream_healthy": upstream_ok,
-                "version": "2.8",
+                "version": "2.9",
                 "token_expires_at": token_mgr._data.get("expires_at", 0),
                 "token_remaining": max(0, token_mgr._data.get("expires_at", 0) - time.time()),
                 "concurrent_limit": MAX_CONCURRENT,
                 "concurrent_active": _active_requests,
+                "cache": response_cache.stats(),
+                "truncation": {
+                    "enabled": ENABLE_TRUNCATE,
+                    "max_history_pairs": MAX_HISTORY_PAIRS,
+                    "max_assistant_chars": MAX_ASSISTANT_CHARS,
+                },
                 "features": [
                     "connection_close",
                     "serial_upstream",
@@ -961,6 +1168,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "model_list_cache",
                     "dynamic_max_tokens",
                     "hot_reload",
+                    "response_cache",
+                    "message_truncation",
                 ],
             }
             self.wfile.write(json.dumps(health).encode())
@@ -972,7 +1181,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(json.dumps(metrics.snapshot()).encode())
+            snapshot = metrics.snapshot()
+            snapshot["cache"] = response_cache.stats()
+            snapshot["truncation"] = {
+                "enabled": ENABLE_TRUNCATE,
+                "max_history_pairs": MAX_HISTORY_PAIRS,
+                "max_assistant_chars": MAX_ASSISTANT_CHARS,
+            }
+            self.wfile.write(json.dumps(snapshot).encode())
             self.wfile.flush()
             return
 
@@ -1000,7 +1216,7 @@ def main():
     signal.signal(signal.SIGHUP, _signal_handler)
 
     server = ThreadingHTTPServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
-    logger.info("Kimi Code Proxy v2.8 started")
+    logger.info("Kimi Code Proxy v2.9 started")
     logger.info(f"  Listen: http://{PROXY_HOST}:{PROXY_PORT}")
     logger.info(f"  Upstream: {UPSTREAM_BASE}")
     logger.info(f"  Concurrent: {MAX_CONCURRENT}, RPM limit: {RPM_LIMIT}, Upstream timeout: {UPSTREAM_TIMEOUT}s, Queue timeout: {QUEUE_TIMEOUT}s")
@@ -1009,6 +1225,8 @@ def main():
     logger.info(f"  Log dir max: {LOG_DIR_MAX_BYTES} bytes")
     logger.info(f"  Graceful shutdown wait: {GRACEFUL_SHUTDOWN_WAIT}s")
     logger.info(f"  Debug body: {DEBUG_BODY}")
+    logger.info(f"  Response cache: enabled={ENABLE_CACHE} ttl={CACHE_TTL}s max_entries={CACHE_MAX_ENTRIES}")
+    logger.info(f"  Message truncation: enabled={ENABLE_TRUNCATE} max_pairs={MAX_HISTORY_PAIRS} max_assistant_chars={MAX_ASSISTANT_CHARS}")
 
     # Start background threads
     threading.Thread(target=refresh_worker, daemon=True).start()
