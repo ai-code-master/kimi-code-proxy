@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-Kimi Code OAuth Proxy v2.6
+Kimi Code OAuth Proxy v2.7
 
 A local HTTP proxy that bridges OpenAI-compatible clients (like Hermes)
 to the Kimi Code API with automatic OAuth token refresh.
 
-Changelog v2.6:
-- Slow request warning when latency > 30s
-- Per-model call statistics in metrics
-- Disk space guard: auto-delete oldest logs when dir is full
+Changelog v2.7:
+- Graceful shutdown on SIGTERM/SIGINT (waits for active requests)
+- Upstream health probe in /healthz (cached, background-checked every 30s)
+- KCP_DEBUG_BODY switch for request/response body logging
+- Body parse errors logged at debug level instead of silently swallowed
 """
 
 import http.client
 import json
 import logging
 import os
+import signal
 import socket
 import ssl
 import sys
@@ -67,6 +69,8 @@ UPSTREAM_TIMEOUT = int(_env("KCP_UPSTREAM_TIMEOUT", "600"))
 QUEUE_TIMEOUT    = int(_env("KCP_QUEUE_TIMEOUT", "300"))
 MAX_BODY_SIZE    = int(_env("KCP_MAX_BODY_SIZE", str(50 * 1024 * 1024)))  # 50MB
 SLOW_REQUEST_THRESHOLD = float(_env("KCP_SLOW_REQUEST_THRESHOLD", "30.0"))
+GRACEFUL_SHUTDOWN_WAIT = int(_env("KCP_GRACEFUL_SHUTDOWN_WAIT", "30"))
+DEBUG_BODY       = _env("KCP_DEBUG_BODY", "").lower() in ("1", "true", "yes")
 
 # Logging
 LOG_DIR          = _env("KCP_LOG_DIR", os.path.expanduser("~/.hermes/logs"))
@@ -109,7 +113,6 @@ def _ensure_disk_space():
                 try:
                     os.remove(path)
                     total -= s
-                    # Use print as logger may not be ready or may deadlock
                     print(f"[kimi-proxy] Disk guard: removed old log {path}", file=sys.stderr)
                 except Exception:
                     pass
@@ -242,6 +245,78 @@ metrics = Metrics()
 kimi_semaphore = threading.Semaphore(MAX_CONCURRENT)
 _active_requests_lock = threading.Lock()
 _active_requests = 0
+_shutdown_event = threading.Event()
+
+# ==================== Upstream Health Probe ====================
+class UpstreamHealth:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._healthy = True
+        self._last_check = 0
+        self._check_interval = 30
+
+    def _do_probe(self):
+        try:
+            token = token_mgr.get_token()
+            if not token:
+                return False
+            parsed = urllib.parse.urlparse(UPSTREAM_BASE)
+            conn = http.client.HTTPSConnection(parsed.netloc, timeout=5)
+            try:
+                conn.request(
+                    "GET",
+                    f"{parsed.path}/v1/models",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "User-Agent": "KimiCLI/1.5",
+                    },
+                )
+                resp = conn.getresponse()
+                # 200 or 401 with valid auth means upstream is reachable
+                healthy = resp.status in (200, 401)
+            finally:
+                conn.close()
+            return healthy
+        except Exception as e:
+            logger.debug(f"Upstream probe failed: {e}")
+            return False
+
+    def check(self):
+        with self._lock:
+            if time.time() - self._last_check < self._check_interval:
+                return self._healthy
+        healthy = self._do_probe()
+        with self._lock:
+            if healthy != self._healthy:
+                if healthy:
+                    logger.info("Upstream health probe: healthy")
+                else:
+                    logger.warning("Upstream health probe: UNHEALTHY")
+            self._healthy = healthy
+            self._last_check = time.time()
+        return healthy
+
+    def is_healthy(self):
+        with self._lock:
+            # Stale check if too old (e.g. probe thread died)
+            if time.time() - self._last_check > self._check_interval * 3:
+                return False
+            return self._healthy
+
+
+upstream_health = UpstreamHealth()
+
+
+def _upstream_probe_worker():
+    check_interval = upstream_health._check_interval
+    while not _shutdown_event.is_set():
+        upstream_health.check()
+        # Sleep in small chunks so we can exit quickly on shutdown
+        for _ in range(check_interval):
+            if _shutdown_event.is_set():
+                break
+            time.sleep(1)
+
 
 # ==================== Token Management ====================
 class TokenManager:
@@ -368,16 +443,17 @@ class TokenManager:
 
 token_mgr = TokenManager()
 
-# ==================== Background Refresh Thread ====================
+# ==================== Background Threads ====================
 def refresh_worker():
-    while True:
-        time.sleep(REFRESH_INTERVAL)
+    while not _shutdown_event.is_set():
+        for _ in range(REFRESH_INTERVAL):
+            if _shutdown_event.is_set():
+                return
+            time.sleep(1)
         if token_mgr.should_refresh():
             logger.info("Token expiring, refreshing...")
             token_mgr.refresh()
 
-
-threading.Thread(target=refresh_worker, daemon=True).start()
 
 # ==================== Error Classification ====================
 def classify_error(e):
@@ -417,6 +493,11 @@ def _maybe_inject_thinking(body_dict: dict) -> dict:
         body_dict["thinking"] = {"type": "enabled", "budget_tokens": budget}
         logger.info(f"Injected thinking=budget_tokens:{budget} from reasoning_effort={effort}")
     return body_dict
+
+
+def _safe_body_preview(body: bytes, max_len: int = 500) -> str:
+    """Return a safe preview of body for debug logging."""
+    return body[:max_len].decode("utf-8", errors="replace")
 
 
 # ==================== Core Request Function ====================
@@ -506,6 +587,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length) if content_length > 0 else b""
         body_len = len(body)
 
+        if DEBUG_BODY and body:
+            logger.debug(f"[{request_id}] Request body preview: {_safe_body_preview(body)}")
+
         path = self.path
         if path.startswith("/api/"):
             path = path[4:]
@@ -535,8 +619,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     logger.debug(f"[{request_id}] Preserving max_tokens={req_json['max_tokens']}")
                 req_json = _maybe_inject_thinking(req_json)
                 body = json.dumps(req_json).encode("utf-8")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[{request_id}] Body enrichment skipped: {e}")
+            if DEBUG_BODY and body:
+                logger.debug(f"[{request_id}] Raw body preview: {_safe_body_preview(body)}")
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -606,6 +692,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     resp.close()
                     if hasattr(resp, "_conn"):
                         resp._conn.close()
+                if DEBUG_BODY and resp_body:
+                    logger.debug(f"[{request_id}] Response body preview: {_safe_body_preview(resp_body)}")
                 log_level = logger.warning if latency > SLOW_REQUEST_THRESHOLD else logger.info
                 log_level(
                     f"[{request_id}] {client_ip} -> {status} "
@@ -651,13 +739,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/healthz":
-            self.send_response(200)
+            upstream_ok = upstream_health.is_healthy()
+            self.send_response(200 if upstream_ok else 503)
             self.send_header("Content-Type", "application/json")
             self.send_header("Connection", "close")
             self.end_headers()
             health = {
-                "status": "ok",
-                "version": "2.6",
+                "status": "ok" if upstream_ok else "degraded",
+                "upstream_healthy": upstream_ok,
+                "version": "2.7",
                 "token_expires_at": token_mgr._data.get("expires_at", 0),
                 "token_remaining": max(0, token_mgr._data.get("expires_at", 0) - time.time()),
                 "concurrent_limit": MAX_CONCURRENT,
@@ -677,6 +767,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "slow_request_warning",
                     "model_stats",
                     "disk_space_guard",
+                    "graceful_shutdown",
+                    "upstream_health_probe",
+                    "debug_body",
                 ],
             }
             self.wfile.write(json.dumps(health).encode())
@@ -698,20 +791,54 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._forward("POST")
 
 
+def _signal_handler(signum, frame):
+    sig_name = signal.Signals(signum).name
+    logger.info(f"Received {sig_name}, starting graceful shutdown...")
+    _shutdown_event.set()
+
+
 def main():
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     server = ThreadingHTTPServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
-    logger.info("Kimi Code Proxy v2.6 started")
+    logger.info("Kimi Code Proxy v2.7 started")
     logger.info(f"  Listen: http://{PROXY_HOST}:{PROXY_PORT}")
     logger.info(f"  Upstream: {UPSTREAM_BASE}")
     logger.info(f"  Concurrent: {MAX_CONCURRENT}, Upstream timeout: {UPSTREAM_TIMEOUT}s, Queue timeout: {QUEUE_TIMEOUT}s")
     logger.info(f"  Max body size: {MAX_BODY_SIZE} bytes")
     logger.info(f"  Slow request threshold: {SLOW_REQUEST_THRESHOLD}s")
     logger.info(f"  Log dir max: {LOG_DIR_MAX_BYTES} bytes")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        server.shutdown()
+    logger.info(f"  Graceful shutdown wait: {GRACEFUL_SHUTDOWN_WAIT}s")
+    logger.info(f"  Debug body: {DEBUG_BODY}")
+
+    # Start background threads
+    threading.Thread(target=refresh_worker, daemon=True).start()
+    threading.Thread(target=_upstream_probe_worker, daemon=True).start()
+
+    # Run server in a thread so we can wait for shutdown signal
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+
+    # Wait for shutdown signal
+    _shutdown_event.wait()
+
+    # Stop accepting new connections
+    logger.info("Shutting down server...")
+    server.shutdown()
+
+    # Wait for active requests to complete
+    wait_start = time.time()
+    while _active_requests > 0 and (time.time() - wait_start) < GRACEFUL_SHUTDOWN_WAIT:
+        time.sleep(0.1)
+
+    if _active_requests > 0:
+        logger.warning(f"Force shutdown with {_active_requests} active requests remaining")
+    else:
+        logger.info("All active requests completed, shutdown cleanly")
+
+    server_thread.join(timeout=5)
+    logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
