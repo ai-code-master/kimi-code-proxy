@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Kimi Code OAuth Proxy v2.9
+Kimi Code OAuth Proxy v3.0
 
 A local HTTP proxy that bridges OpenAI-compatible clients (like Hermes)
 to the Kimi Code API with automatic OAuth token refresh.
+
+Changelog v3.0:
+- Single-flight request coalescing: concurrent identical requests share one upstream call
+- Lightweight semantic cache: similar requests (not just identical) hit cache
+- Token usage tracking: input/output/total tokens recorded per request
 
 Changelog v2.9:
 - Response cache: identical non-streaming requests return cached result (saves 100% token)
@@ -16,6 +21,7 @@ Changelog v2.8:
 - Admin API for runtime config inspection
 """
 
+import difflib
 import hashlib
 import http.client
 import json
@@ -120,6 +126,12 @@ CACHE_MAX_ENTRIES = int(_env("KCP_CACHE_MAX_ENTRIES", "100"))
 ENABLE_TRUNCATE  = _env("KCP_ENABLE_TRUNCATE", "1").lower() in ("1", "true", "yes")
 MAX_HISTORY_PAIRS = int(_env("KCP_MAX_HISTORY_PAIRS", "10"))
 MAX_ASSISTANT_CHARS = int(_env("KCP_MAX_ASSISTANT_CHARS", "2000"))
+
+# Single-flight & Semantic cache
+ENABLE_SINGLE_FLIGHT = _env("KCP_ENABLE_SINGLE_FLIGHT", "1").lower() in ("1", "true", "yes")
+SINGLE_FLIGHT_TIMEOUT = int(_env("KCP_SINGLE_FLIGHT_TIMEOUT", "30"))
+ENABLE_SEMANTIC_CACHE = _env("KCP_ENABLE_SEMANTIC_CACHE", "1").lower() in ("1", "true", "yes")
+SEMANTIC_THRESHOLD = float(_env("KCP_SEMANTIC_THRESHOLD", "0.75"))
 
 # Logging
 LOG_DIR          = _env("KCP_LOG_DIR", os.path.expanduser("~/.hermes/logs"))
@@ -238,8 +250,13 @@ class Metrics:
         self.queue_wait_sum = 0.0
         self.queue_wait_count = 0
         self.model_counts = {}
+        # Token usage tracking
+        self.input_tokens_sum = 0
+        self.output_tokens_sum = 0
+        self.total_tokens_sum = 0
+        self.token_record_count = 0
 
-    def record_request(self, latency: float, status: int | None = None, queue_wait: float = 0.0, model: str = ""):
+    def record_request(self, latency: float, status: int | None = None, queue_wait: float = 0.0, model: str = "", tokens: dict | None = None):
         with self._lock:
             self.request_count += 1
             self.latency_sum += latency
@@ -255,6 +272,11 @@ class Metrics:
                 self.model_counts[model] = self.model_counts.get(model, 0) + 1
             if latency > SLOW_REQUEST_THRESHOLD:
                 self.slow_request_count += 1
+            if tokens:
+                self.input_tokens_sum += tokens.get("input", 0)
+                self.output_tokens_sum += tokens.get("output", 0)
+                self.total_tokens_sum += tokens.get("total", 0)
+                self.token_record_count += 1
 
     def record_timeout(self):
         with self._lock:
@@ -285,6 +307,12 @@ class Metrics:
                 "avg_queue_wait_ms": round(avg_queue * 1000, 2),
                 "status_counts": dict(self.status_counts),
                 "model_counts": dict(self.model_counts),
+                "tokens": {
+                    "input_total": self.input_tokens_sum,
+                    "output_total": self.output_tokens_sum,
+                    "total": self.total_tokens_sum,
+                    "recorded_requests": self.token_record_count,
+                },
             }
 
 
@@ -374,41 +402,49 @@ model_cache = ModelListCache(ttl=300)
 class ResponseCache:
     """In-memory cache for LLM non-streaming responses.
     
-    Keyed by deterministic hash of cacheable request fields.
-    Only caches /v1/chat/completions with stream=false and no tools.
+    Supports exact-match caching and lightweight semantic caching
+    (difflib-based similarity matching on the last user message).
     """
 
     def __init__(self, ttl: int = 300, max_entries: int = 100):
         self._ttl = ttl
         self._max_entries = max_entries
         self._lock = threading.Lock()
-        self._cache = {}  # key -> (expires_at, data_bytes, headers_list)
+        self._cache = {}       # key -> (expires_at, data_bytes, headers_list)
+        self._signatures = {}  # key -> (model, last_user_msg, temperature)
         self._hit_count = 0
         self._miss_count = 0
+        self._semantic_hit_count = 0
 
     def _make_key(self, path: str, body_dict: dict) -> str:
         """Create cache key; return '' if request should not be cached."""
         if not ENABLE_CACHE:
             return ""
-        # Only cache chat completions
         if path not in ("/v1/chat/completions", "/chat/completions"):
             return ""
-        # Don't cache streaming
         if body_dict.get("stream"):
             return ""
-        # Don't cache tool-related requests (results vary)
         if body_dict.get("tools") or body_dict.get("tool_choice"):
             return ""
-        # Fields that affect output
         cacheable = {"model", "messages", "temperature", "top_p",
                      "max_tokens", "presence_penalty", "frequency_penalty",
                      "response_format", "thinking", "reasoning_effort"}
         payload = {k: body_dict.get(k) for k in cacheable if k in body_dict}
-        # Omit default temperature to increase hit rate
         if payload.get("temperature") == 1.0:
             del payload["temperature"]
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _last_user_message(self, body_dict: dict) -> str:
+        messages = body_dict.get("messages", [])
+        if not isinstance(messages, list):
+            return ""
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+        return ""
 
     def get(self, path: str, body_dict: dict) -> tuple[bytes, list] | None:
         key = self._make_key(path, body_dict)
@@ -422,10 +458,53 @@ class ResponseCache:
             expires_at, data, headers = entry
             if time.time() > expires_at:
                 del self._cache[key]
+                del self._signatures[key]
                 self._miss_count += 1
                 return None
             self._hit_count += 1
             return data, headers
+
+    def get_semantic(self, path: str, body_dict: dict) -> tuple[bytes, list] | None:
+        """Try exact match first, then semantic match on last user message."""
+        # Exact match
+        result = self.get(path, body_dict)
+        if result:
+            return result
+        if not ENABLE_SEMANTIC_CACHE:
+            return None
+        key = self._make_key(path, body_dict)
+        if not key:
+            return None
+        query = self._last_user_message(body_dict)
+        if not query or len(query) < 10:
+            return None
+        model = body_dict.get("model", "")
+        temp = body_dict.get("temperature", 1.0)
+        with self._lock:
+            now = time.time()
+            best_key = None
+            best_ratio = 0.0
+            for ck, sig in self._signatures.items():
+                if ck not in self._cache:
+                    continue
+                sig_model, sig_msg, sig_temp = sig
+                # Model and temperature must match for semantic hit
+                if sig_model != model or abs(sig_temp - temp) > 0.01:
+                    continue
+                expires_at = self._cache[ck][0]
+                if now > expires_at:
+                    continue
+                if not sig_msg or len(sig_msg) < 10:
+                    continue
+                ratio = difflib.SequenceMatcher(None, query, sig_msg).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_key = ck
+            if best_key and best_ratio >= SEMANTIC_THRESHOLD:
+                self._semantic_hit_count += 1
+                self._hit_count += 1
+                return self._cache[best_key][1], self._cache[best_key][2]
+        return None
 
     def put(self, path: str, body_dict: dict, data: bytes, headers: list, status: int):
         if status != 200:
@@ -435,21 +514,28 @@ class ResponseCache:
             return
         with self._lock:
             if len(self._cache) >= self._max_entries:
-                # Evict oldest by expiration time
                 oldest = min(self._cache.keys(), key=lambda k: self._cache[k][0])
                 del self._cache[oldest]
+                del self._signatures[oldest]
             filtered = [(h, v) for h, v in headers if h.lower() == "content-type"]
             self._cache[key] = (time.time() + self._ttl, data, filtered)
+            self._signatures[key] = (
+                body_dict.get("model", ""),
+                self._last_user_message(body_dict),
+                body_dict.get("temperature", 1.0),
+            )
 
     def stats(self):
         with self._lock:
             total = self._hit_count + self._miss_count
             return {
                 "enabled": ENABLE_CACHE,
+                "semantic_enabled": ENABLE_SEMANTIC_CACHE,
                 "entries": len(self._cache),
                 "ttl": self._ttl,
                 "max_entries": self._max_entries,
                 "hit_count": self._hit_count,
+                "semantic_hits": self._semantic_hit_count,
                 "miss_count": self._miss_count,
                 "hit_rate": round(self._hit_count / total, 4) if total else 0.0,
             }
@@ -457,13 +543,117 @@ class ResponseCache:
     def clear(self):
         with self._lock:
             self._cache.clear()
+            self._signatures.clear()
             self._hit_count = 0
+            self._semantic_hit_count = 0
             self._miss_count = 0
 
 
 response_cache = ResponseCache(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
 
-# ==================== Upstream Health Probe ====================
+# ==================== Single-Flight Request Coalescing ====================
+class SingleFlight:
+    """Coalesce concurrent identical requests into a single upstream call."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._inflight = {}  # key -> (condition, result, error, done)
+
+    def _make_key(self, method: str, path: str, body: bytes) -> str:
+        if not ENABLE_SINGLE_FLIGHT:
+            return ""
+        if method != "POST" or path not in ("/v1/chat/completions", "/chat/completions"):
+            return ""
+        return hashlib.sha256(f"{method}:{path}:".encode() + body).hexdigest()
+
+    def do(self, method: str, path: str, body: bytes, callable_fn):
+        """Execute callable_fn, coalescing with concurrent identical requests.
+        Returns (result, is_coalesced)."""
+        key = self._make_key(method, path, body)
+        if not key:
+            return callable_fn(), False
+
+        with self._lock:
+            entry = self._inflight.get(key)
+            if entry is None:
+                # We are the leader
+                cond = threading.Condition(self._lock)
+                self._inflight[key] = [cond, None, None, False]
+                is_leader = True
+            else:
+                # We are a follower; wait on the leader's condition
+                cond = entry[0]
+                is_leader = False
+
+        if not is_leader:
+            # Wait for leader to finish
+            with cond:
+                while True:
+                    with self._lock:
+                        entry = self._inflight.get(key)
+                        if entry is None or entry[3]:
+                            break
+                    cond.wait(timeout=SINGLE_FLIGHT_TIMEOUT)
+            with self._lock:
+                entry = self._inflight.get(key)
+            if entry and entry[3]:
+                if entry[2]:
+                    raise entry[2]
+                return entry[1], True
+            # Timeout or race: fall through to leader path
+            with self._lock:
+                if key not in self._inflight:
+                    cond = threading.Condition(self._lock)
+                    self._inflight[key] = [cond, None, None, False]
+                    is_leader = True
+                else:
+                    entry = self._inflight[key]
+                    if entry[3]:
+                        if entry[2]:
+                            raise entry[2]
+                        return entry[1], True
+                    # Still waiting, try one more time
+                    cond = entry[0]
+            if not is_leader:
+                with cond:
+                    cond.wait(timeout=SINGLE_FLIGHT_TIMEOUT)
+                with self._lock:
+                    entry = self._inflight.get(key)
+                if entry and entry[3]:
+                    if entry[2]:
+                        raise entry[2]
+                    return entry[1], True
+                # Give up and do it ourselves
+                is_leader = True
+                with self._lock:
+                    if key in self._inflight:
+                        del self._inflight[key]
+                    cond = threading.Condition(self._lock)
+                    self._inflight[key] = [cond, None, None, False]
+
+        # Leader executes
+        try:
+            result = callable_fn()
+            with cond:
+                with self._lock:
+                    self._inflight[key][1] = result
+                    self._inflight[key][3] = True
+                cond.notify_all()
+            return result, False
+        except Exception as e:
+            with cond:
+                with self._lock:
+                    self._inflight[key][2] = e
+                    self._inflight[key][3] = True
+                cond.notify_all()
+            raise
+        finally:
+            with self._lock:
+                if key in self._inflight and self._inflight[key][3]:
+                    del self._inflight[key]
+
+
+single_flight = SingleFlight()
 class UpstreamHealth:
     def __init__(self):
         self._lock = threading.Lock()
@@ -839,6 +1029,14 @@ def _current_config():
             "max_history_pairs": MAX_HISTORY_PAIRS,
             "max_assistant_chars": MAX_ASSISTANT_CHARS,
         },
+        "single_flight": {
+            "enabled": ENABLE_SINGLE_FLIGHT,
+            "timeout": SINGLE_FLIGHT_TIMEOUT,
+        },
+        "semantic_cache": {
+            "enabled": ENABLE_SEMANTIC_CACHE,
+            "threshold": SEMANTIC_THRESHOLD,
+        },
     }
 
 
@@ -1047,7 +1245,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 f"[{request_id}] {client_ip} -> {method} {path} "
                 f"body={body_len}b queue_wait={queue_wait:.2f}s active={_active_requests}/{MAX_CONCURRENT}"
             )
-            resp, error = _do_kimi_request(method, target_url, body, headers)
+
+            # Single-flight: coalesce concurrent identical requests
+            def _do_request():
+                return _do_kimi_request(method, target_url, body, headers)
+
+            try:
+                (resp, error), coalesced = single_flight.do(method, path, body, _do_request)
+            except Exception as e:
+                resp, error, coalesced = None, e, False
 
             if resp and resp.status == 401:
                 logger.warning(f"[{request_id}] {client_ip} -> 401, refreshing token...")
@@ -1065,11 +1271,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if resp:
                 latency = time.time() - start_time
                 status = resp.status
-                metrics.record_request(latency, status, queue_wait, model_name)
-                # Read response body for size logging
+                # Parse token usage from response
+                tokens = {"input": 0, "output": 0, "total": 0}
                 try:
                     resp_body = resp.read()
                     resp_len = len(resp_body)
+                    if resp_body:
+                        try:
+                            resp_json = json.loads(resp_body)
+                            usage = resp_json.get("usage", {})
+                            tokens["input"] = usage.get("prompt_tokens", 0)
+                            tokens["output"] = usage.get("completion_tokens", 0)
+                            tokens["total"] = usage.get("total_tokens", 0)
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.error(f"[{request_id}] Failed to read response body: {e}")
                     resp_body = b""
@@ -1083,11 +1298,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 # Store successful response in cache
                 if req_json and status == 200:
                     response_cache.put(path, req_json, resp_body, resp.getheaders(), status)
+                metrics.record_request(latency, status, queue_wait, model_name, tokens)
+                coalesced_tag = " (coalesced)" if coalesced else ""
                 log_level = logger.warning if latency > SLOW_REQUEST_THRESHOLD else logger.info
                 log_level(
-                    f"[{request_id}] {client_ip} -> {status} "
+                    f"[{request_id}] {client_ip} -> {status}{coalesced_tag} "
                     f"latency={latency:.2f}s queue={queue_wait:.2f}s "
-                    f"req={body_len}b resp={resp_len}b model={model_name or '-'}"
+                    f"req={body_len}b resp={resp_len}b "
+                    f"tokens={tokens['input']}+{tokens['output']}={tokens['total']} "
+                    f"model={model_name or '-'}"
                 )
                 self._send_response(status, resp.getheaders(), resp_body)
             else:
@@ -1136,7 +1355,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             health = {
                 "status": "ok" if upstream_ok else "degraded",
                 "upstream_healthy": upstream_ok,
-                "version": "2.9",
+                "version": "3.0",
                 "token_expires_at": token_mgr._data.get("expires_at", 0),
                 "token_remaining": max(0, token_mgr._data.get("expires_at", 0) - time.time()),
                 "concurrent_limit": MAX_CONCURRENT,
@@ -1146,6 +1365,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "enabled": ENABLE_TRUNCATE,
                     "max_history_pairs": MAX_HISTORY_PAIRS,
                     "max_assistant_chars": MAX_ASSISTANT_CHARS,
+                },
+                "single_flight": {
+                    "enabled": ENABLE_SINGLE_FLIGHT,
+                    "timeout": SINGLE_FLIGHT_TIMEOUT,
+                },
+                "semantic_cache": {
+                    "enabled": ENABLE_SEMANTIC_CACHE,
+                    "threshold": SEMANTIC_THRESHOLD,
                 },
                 "features": [
                     "connection_close",
@@ -1170,6 +1397,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "hot_reload",
                     "response_cache",
                     "message_truncation",
+                    "single_flight",
+                    "semantic_cache",
+                    "token_tracking",
                 ],
             }
             self.wfile.write(json.dumps(health).encode())
@@ -1187,6 +1417,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "enabled": ENABLE_TRUNCATE,
                 "max_history_pairs": MAX_HISTORY_PAIRS,
                 "max_assistant_chars": MAX_ASSISTANT_CHARS,
+            }
+            snapshot["single_flight"] = {
+                "enabled": ENABLE_SINGLE_FLIGHT,
+                "timeout": SINGLE_FLIGHT_TIMEOUT,
+            }
+            snapshot["semantic_cache"] = {
+                "enabled": ENABLE_SEMANTIC_CACHE,
+                "threshold": SEMANTIC_THRESHOLD,
             }
             self.wfile.write(json.dumps(snapshot).encode())
             self.wfile.flush()
@@ -1216,7 +1454,7 @@ def main():
     signal.signal(signal.SIGHUP, _signal_handler)
 
     server = ThreadingHTTPServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
-    logger.info("Kimi Code Proxy v2.9 started")
+    logger.info("Kimi Code Proxy v3.0 started")
     logger.info(f"  Listen: http://{PROXY_HOST}:{PROXY_PORT}")
     logger.info(f"  Upstream: {UPSTREAM_BASE}")
     logger.info(f"  Concurrent: {MAX_CONCURRENT}, RPM limit: {RPM_LIMIT}, Upstream timeout: {UPSTREAM_TIMEOUT}s, Queue timeout: {QUEUE_TIMEOUT}s")
@@ -1225,8 +1463,9 @@ def main():
     logger.info(f"  Log dir max: {LOG_DIR_MAX_BYTES} bytes")
     logger.info(f"  Graceful shutdown wait: {GRACEFUL_SHUTDOWN_WAIT}s")
     logger.info(f"  Debug body: {DEBUG_BODY}")
-    logger.info(f"  Response cache: enabled={ENABLE_CACHE} ttl={CACHE_TTL}s max_entries={CACHE_MAX_ENTRIES}")
+    logger.info(f"  Response cache: enabled={ENABLE_CACHE} semantic={ENABLE_SEMANTIC_CACHE} ttl={CACHE_TTL}s max_entries={CACHE_MAX_ENTRIES}")
     logger.info(f"  Message truncation: enabled={ENABLE_TRUNCATE} max_pairs={MAX_HISTORY_PAIRS} max_assistant_chars={MAX_ASSISTANT_CHARS}")
+    logger.info(f"  Single-flight: enabled={ENABLE_SINGLE_FLIGHT} timeout={SINGLE_FLIGHT_TIMEOUT}s")
 
     # Start background threads
     threading.Thread(target=refresh_worker, daemon=True).start()
