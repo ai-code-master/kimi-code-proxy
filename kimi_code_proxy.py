@@ -60,7 +60,8 @@ CLIENT_ID        = _env("KCP_CLIENT_ID",        "")
 # Server
 PROXY_HOST       = _env("KCP_HOST", "127.0.0.1")
 PROXY_PORT       = int(_env("KCP_PORT", "8765"))
-MAX_CONCURRENT   = int(_env("KCP_MAX_CONCURRENT", "2"))
+MAX_CONCURRENT   = int(_env("KCP_MAX_CONCURRENT", "4"))
+RPM_LIMIT        = int(_env("KCP_RPM_LIMIT", "20"))
 MAX_RETRIES      = int(_env("KCP_MAX_RETRIES", "2"))
 BACKOFF_BASE     = float(_env("KCP_BACKOFF_BASE", "1.0"))
 REFRESH_INTERVAL = int(_env("KCP_REFRESH_INTERVAL", "300"))
@@ -240,6 +241,38 @@ class Metrics:
 
 
 metrics = Metrics()
+
+# ==================== RPM Limiter ====================
+class RPMLimiter:
+    """Simple sliding-window RPM limiter."""
+
+    def __init__(self, max_rpm: int):
+        self._max_rpm = max_rpm
+        self._lock = threading.Lock()
+        self._timestamps = []
+
+    def allow(self) -> bool:
+        if self._max_rpm <= 0:
+            return True
+        now = time.time()
+        window_start = now - 60
+        with self._lock:
+            # Drop old timestamps
+            self._timestamps = [t for t in self._timestamps if t > window_start]
+            if len(self._timestamps) >= self._max_rpm:
+                return False
+            self._timestamps.append(now)
+            return True
+
+    def current(self) -> int:
+        now = time.time()
+        window_start = now - 60
+        with self._lock:
+            self._timestamps = [t for t in self._timestamps if t > window_start]
+            return len(self._timestamps)
+
+
+rpm_limiter = RPMLimiter(RPM_LIMIT)
 
 # ==================== Concurrency Control ====================
 kimi_semaphore = threading.Semaphore(MAX_CONCURRENT)
@@ -575,6 +608,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error(401, "No Kimi Code token available")
             return
 
+        # --- RPM guard ---
+        if not rpm_limiter.allow():
+            latency = time.time() - start_time
+            metrics.record_request(latency, 429)
+            current_rpm = rpm_limiter.current()
+            logger.warning(f"[{request_id}] {client_ip} -> 429 (RPM limit {current_rpm}/{RPM_LIMIT})")
+            self._send_error(429, f"Rate limit exceeded: {current_rpm} requests in the last minute")
+            return
+
         # --- Body size guard ---
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length > MAX_BODY_SIZE:
@@ -805,7 +847,7 @@ def main():
     logger.info("Kimi Code Proxy v2.7 started")
     logger.info(f"  Listen: http://{PROXY_HOST}:{PROXY_PORT}")
     logger.info(f"  Upstream: {UPSTREAM_BASE}")
-    logger.info(f"  Concurrent: {MAX_CONCURRENT}, Upstream timeout: {UPSTREAM_TIMEOUT}s, Queue timeout: {QUEUE_TIMEOUT}s")
+    logger.info(f"  Concurrent: {MAX_CONCURRENT}, RPM limit: {RPM_LIMIT}, Upstream timeout: {UPSTREAM_TIMEOUT}s, Queue timeout: {QUEUE_TIMEOUT}s")
     logger.info(f"  Max body size: {MAX_BODY_SIZE} bytes")
     logger.info(f"  Slow request threshold: {SLOW_REQUEST_THRESHOLD}s")
     logger.info(f"  Log dir max: {LOG_DIR_MAX_BYTES} bytes")
