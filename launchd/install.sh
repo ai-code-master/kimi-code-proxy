@@ -11,14 +11,21 @@ PLIST_DST="$HOME/Library/LaunchAgents/io.github.kimi-code-proxy.plist"
 echo "Installing launchd service..."
 echo "  Project dir: $PROJECT_DIR"
 
+PYTHON3_PATH="$(which python3)"
+
 # Substitute paths
 sed -e "s|/ABSOLUTE/PATH/TO/kimi-code-proxy|$PROJECT_DIR|g" \
     -e "s|/ABSOLUTE/PATH/TO/kimi_code_proxy.py|$PROJECT_DIR/kimi_code_proxy.py|g" \
+    -e "s|/PATH/TO/python3|$PYTHON3_PATH|g" \
     -e "s|/Users/YOUR_USERNAME|$HOME|g" \
     -e "s|io.github.YOUR_USERNAME.kimi-code-proxy|io.github.kimi-code-proxy|g" \
     "$PLIST_SRC" > "$PLIST_DST"
 
+# Stop any existing manual or launchd instance
 launchctl unload "$PLIST_DST" 2>/dev/null || true
+pkill -f "kimi_code_proxy.py" 2>/dev/null || true
+sleep 1
+
 launchctl load "$PLIST_DST"
 launchctl start io.github.kimi-code-proxy
 
